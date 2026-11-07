@@ -7,6 +7,9 @@ const DOS_HEADER_MIN: usize = 64;
 const E_LFANEW_OFFSET: usize = 0x3C;
 const PE_SIGNATURE: u32 = 0x0000_4550;
 const COFF_SIZE: usize = 20;
+const OPTIONAL_MAGIC_PE32: u16 = 0x010B;
+const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020B;
+const DATA_DIRECTORY_ENTRIES: usize = 16;
 
 #[derive(Debug)]
 enum Error {
@@ -24,6 +27,11 @@ enum Error {
     },
     BadDosMagic(u16),
     BadPeSignature(u32),
+    BadOptionalMagic(u16),
+    OptionalHeaderTooSmall {
+        size: usize,
+        minimum: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -45,6 +53,14 @@ impl fmt::Display for Error {
             Error::BadPeSignature(s) => write!(
                 f,
                 "firma PE inválida: 0x{s:08X}, se esperaba 0x00004550 (PE\\0\\0)"
+            ),
+            Error::BadOptionalMagic(m) => write!(
+                f,
+                "optional header desconocido: Magic = 0x{m:04X}, se esperaba 0x010B (PE32) o 0x020B (PE32+)"
+            ),
+            Error::OptionalHeaderTooSmall { size, minimum } => write!(
+                f,
+                "optional header de {size} bytes; se necesitan al menos {minimum}"
             ),
         }
     }
@@ -68,6 +84,47 @@ struct Headers {
     number_of_symbols: u32,
     size_of_optional_header: u16,
     characteristics: u16,
+    optional: OptionalHeader,
+}
+
+#[derive(Debug)]
+struct DataDirectoryEntry {
+    index: usize,
+    rva: u32,
+    size: u32,
+}
+
+impl DataDirectoryEntry {
+    fn is_empty(&self) -> bool {
+        self.rva == 0 && self.size == 0
+    }
+}
+
+#[derive(Debug)]
+struct OptionalHeader {
+    magic: u16,
+    address_of_entry_point: u32,
+    base_of_code: u32,
+    image_base: u64,
+    section_alignment: u32,
+    file_alignment: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    subsystem: u16,
+    dll_characteristics: u16,
+    number_of_rva_and_sizes: u32,
+    data_directory_offset: usize,
+    data_directories: Vec<DataDirectoryEntry>,
+}
+
+impl OptionalHeader {
+    fn is_pe32_plus(&self) -> bool {
+        self.magic == OPTIONAL_MAGIC_PE32_PLUS
+    }
+
+    fn magic_name(&self) -> &'static str {
+        if self.is_pe32_plus() { "PE32+" } else { "PE32" }
+    }
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -100,6 +157,115 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = offset.checked_add(8).ok_or(Error::OutOfBounds {
+        offset,
+        need: 8,
+        len: bytes.len(),
+    })?;
+    let slice = bytes.get(offset..end).ok_or(Error::OutOfBounds {
+        offset,
+        need: 8,
+        len: bytes.len(),
+    })?;
+    Ok(u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]))
+}
+
+fn parse_optional(
+    bytes: &[u8],
+    optional_start: usize,
+    declared_size: u16,
+) -> Result<OptionalHeader> {
+    let declared_size = declared_size as usize;
+
+    if declared_size < 2 {
+        return Err(Error::OptionalHeaderTooSmall {
+            size: declared_size,
+            minimum: 2,
+        });
+    }
+
+    let optional_end = optional_start
+        .checked_add(declared_size)
+        .ok_or(Error::OutOfBounds {
+            offset: optional_start,
+            need: declared_size,
+            len: bytes.len(),
+        })?;
+
+    if optional_end > bytes.len() {
+        return Err(Error::TooShort {
+            what: "optional header",
+            need: optional_end,
+            got: bytes.len(),
+        });
+    }
+
+    let magic = read_u16(bytes, optional_start)?;
+
+    let (
+        image_base_offset,
+        image_base_size,
+        number_of_rva_and_sizes_offset,
+        data_directory_offset,
+        minimum,
+    ) = match magic {
+        OPTIONAL_MAGIC_PE32 => (0x1C, 4, 0x5C, 0x60, 0x60),
+        OPTIONAL_MAGIC_PE32_PLUS => (0x18, 8, 0x6C, 0x70, 0x70),
+        other => return Err(Error::BadOptionalMagic(other)),
+    };
+
+    if declared_size < minimum {
+        return Err(Error::OptionalHeaderTooSmall {
+            size: declared_size,
+            minimum,
+        });
+    }
+
+    let image_base = if image_base_size == 8 {
+        read_u64(bytes, optional_start + image_base_offset)?
+    } else {
+        read_u32(bytes, optional_start + image_base_offset)? as u64
+    };
+
+    let number_of_rva_and_sizes = read_u32(bytes, optional_start + number_of_rva_and_sizes_offset)?;
+    let data_directory_offset = optional_start + data_directory_offset;
+
+    // Solo existen las entradas que caben dentro del optional header declarado.
+    let available_entries = (optional_end - data_directory_offset) / 8;
+    let entry_count = (number_of_rva_and_sizes as usize)
+        .min(DATA_DIRECTORY_ENTRIES)
+        .min(available_entries);
+
+    let mut data_directories = Vec::with_capacity(entry_count);
+    for index in 0..entry_count {
+        let entry_offset = data_directory_offset + index * 8;
+        data_directories.push(DataDirectoryEntry {
+            index,
+            rva: read_u32(bytes, entry_offset)?,
+            size: read_u32(bytes, entry_offset + 4)?,
+        });
+    }
+
+    Ok(OptionalHeader {
+        magic,
+        address_of_entry_point: read_u32(bytes, optional_start + 0x10)?,
+        base_of_code: read_u32(bytes, optional_start + 0x14)?,
+        image_base,
+        section_alignment: read_u32(bytes, optional_start + 0x20)?,
+        file_alignment: read_u32(bytes, optional_start + 0x24)?,
+        size_of_image: read_u32(bytes, optional_start + 0x38)?,
+        size_of_headers: read_u32(bytes, optional_start + 0x3C)?,
+        subsystem: read_u16(bytes, optional_start + 0x44)?,
+        dll_characteristics: read_u16(bytes, optional_start + 0x46)?,
+        number_of_rva_and_sizes,
+        data_directory_offset,
+        data_directories,
+    })
+}
+
 fn parse(bytes: &[u8]) -> Result<Headers> {
     if bytes.len() < DOS_HEADER_MIN {
         return Err(Error::TooShort {
@@ -129,6 +295,9 @@ fn parse(bytes: &[u8]) -> Result<Headers> {
         });
     }
 
+    let size_of_optional_header = read_u16(bytes, coff + 16)?;
+    let optional = parse_optional(bytes, coff + COFF_SIZE, size_of_optional_header)?;
+
     Ok(Headers {
         e_lfanew,
         machine: read_u16(bytes, coff)?,
@@ -136,8 +305,9 @@ fn parse(bytes: &[u8]) -> Result<Headers> {
         time_date_stamp: read_u32(bytes, coff + 4)?,
         pointer_to_symbol_table: read_u32(bytes, coff + 8)?,
         number_of_symbols: read_u32(bytes, coff + 12)?,
-        size_of_optional_header: read_u16(bytes, coff + 16)?,
+        size_of_optional_header,
         characteristics: read_u16(bytes, coff + 18)?,
+        optional,
     })
 }
 
@@ -182,6 +352,46 @@ fn characteristics_names(characteristics: u16) -> String {
         names.push("-");
     }
     names.join(" | ")
+}
+
+fn subsystem_name(subsystem: u16) -> &'static str {
+    match subsystem {
+        1 => "NATIVE",
+        2 => "WINDOWS_GUI",
+        3 => "WINDOWS_CUI",
+        5 => "OS2_CUI",
+        7 => "POSIX_CUI",
+        9 => "WINDOWS_CE_GUI",
+        10 => "EFI_APPLICATION",
+        11 => "EFI_BOOT_SERVICE_DRIVER",
+        12 => "EFI_RUNTIME_DRIVER",
+        13 => "EFI_ROM",
+        14 => "XBOX",
+        16 => "WINDOWS_BOOT_APPLICATION",
+        _ => "DESCONOCIDO",
+    }
+}
+
+fn data_directory_name(index: usize) -> &'static str {
+    match index {
+        0 => "Export",
+        1 => "Import",
+        2 => "Resource",
+        3 => "Exception",
+        4 => "Certificate",
+        5 => "Base Relocation",
+        6 => "Debug",
+        7 => "Architecture",
+        8 => "Global Ptr",
+        9 => "TLS",
+        10 => "Load Config",
+        11 => "Bound Import",
+        12 => "IAT",
+        13 => "Delay Import",
+        14 => "CLR Runtime",
+        15 => "Reserved",
+        _ => "Desconocido",
+    }
 }
 
 fn print_headers(path: &str, bytes: &[u8], headers: &Headers) {
@@ -233,7 +443,85 @@ fn print_headers(path: &str, bytes: &[u8], headers: &Headers) {
         characteristics_names(headers.characteristics)
     );
     println!();
-    println!("Optional header en 0x{optional:08X} (pendiente: miércoles)");
+    println!(
+        "Optional header en 0x{optional:08X} ({} bytes)",
+        headers.size_of_optional_header
+    );
+    println!(
+        "  {:<20} 0x{:04X} ({})",
+        "Magic",
+        headers.optional.magic,
+        headers.optional.magic_name()
+    );
+    println!(
+        "  {:<20} 0x{:08X} ({})",
+        "AddressOfEntryPoint",
+        headers.optional.address_of_entry_point,
+        headers.optional.address_of_entry_point
+    );
+    println!(
+        "  {:<20} 0x{:08X}",
+        "BaseOfCode", headers.optional.base_of_code
+    );
+    println!("  {:<20} 0x{:X}", "ImageBase", headers.optional.image_base);
+    println!(
+        "  {:<20} 0x{:X}",
+        "SectionAlignment", headers.optional.section_alignment
+    );
+    println!(
+        "  {:<20} 0x{:X}",
+        "FileAlignment", headers.optional.file_alignment
+    );
+    println!(
+        "  {:<20} 0x{:X}",
+        "SizeOfImage", headers.optional.size_of_image
+    );
+    println!(
+        "  {:<20} 0x{:X}",
+        "SizeOfHeaders", headers.optional.size_of_headers
+    );
+    println!(
+        "  {:<20} {} ({})",
+        "Subsystem",
+        headers.optional.subsystem,
+        subsystem_name(headers.optional.subsystem)
+    );
+    println!(
+        "  {:<20} 0x{:04X}",
+        "DllCharacteristics", headers.optional.dll_characteristics
+    );
+    println!(
+        "  {:<20} {}",
+        "NumberOfRvaAndSizes", headers.optional.number_of_rva_and_sizes
+    );
+    println!(
+        "  {:<20} 0x{:08X} ({} entradas)",
+        "DataDirectory",
+        headers.optional.data_directory_offset,
+        headers.optional.data_directories.len()
+    );
+
+    if !headers.optional.data_directories.is_empty() {
+        println!("  Data directories:");
+
+        for entry in &headers.optional.data_directories {
+            let name = data_directory_name(entry.index);
+
+            if entry.is_empty() {
+                println!("    [{:>2}] {:<18} -", entry.index, name);
+            } else {
+                let suffix = if entry.index == 4 {
+                    " (file offset)"
+                } else {
+                    ""
+                };
+                println!(
+                    "    [{:>2}] {:<18} 0x{:08X} / 0x{:08X}{}",
+                    entry.index, name, entry.rva, entry.size, suffix
+                );
+            }
+        }
+    }
 }
 
 fn print_usage() {
@@ -294,6 +582,28 @@ mod tests {
         bytes[coff + 4..coff + 8].copy_from_slice(&0xD483ACA1u32.to_le_bytes());
         bytes[coff + 16..coff + 18].copy_from_slice(&0x00F0u16.to_le_bytes());
         bytes[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes());
+
+        let opt = 0x98;
+        bytes[opt..opt + 2].copy_from_slice(&OPTIONAL_MAGIC_PE32_PLUS.to_le_bytes());
+        bytes[opt + 0x10..opt + 0x14].copy_from_slice(&0x1440u32.to_le_bytes());
+        bytes[opt + 0x14..opt + 0x18].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[opt + 0x18..opt + 0x20].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        bytes[opt + 0x20..opt + 0x24].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[opt + 0x24..opt + 0x28].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[opt + 0x38..opt + 0x3C].copy_from_slice(&0x27000u32.to_le_bytes());
+        bytes[opt + 0x3C..opt + 0x40].copy_from_slice(&0x600u32.to_le_bytes());
+        bytes[opt + 0x44..opt + 0x46].copy_from_slice(&3u16.to_le_bytes());
+        bytes[opt + 0x46..opt + 0x48].copy_from_slice(&0x160u16.to_le_bytes());
+        bytes[opt + 0x6C..opt + 0x70].copy_from_slice(&16u32.to_le_bytes());
+
+        let dd = opt + 0x70;
+        bytes[dd + 8..dd + 12].copy_from_slice(&0x9000u32.to_le_bytes());
+        bytes[dd + 12..dd + 16].copy_from_slice(&0x908u32.to_le_bytes());
+        bytes[dd + 3 * 8..dd + 3 * 8 + 4].copy_from_slice(&0x6000u32.to_le_bytes());
+        bytes[dd + 3 * 8 + 4..dd + 3 * 8 + 8].copy_from_slice(&0x234u32.to_le_bytes());
+        bytes[dd + 12 * 8..dd + 12 * 8 + 4].copy_from_slice(&0x9280u32.to_le_bytes());
+        bytes[dd + 12 * 8 + 4..dd + 12 * 8 + 8].copy_from_slice(&0x1B8u32.to_le_bytes());
+
         bytes
     }
 
@@ -307,11 +617,54 @@ mod tests {
         assert_eq!(headers.time_date_stamp, 0xD483ACA1);
         assert_eq!(headers.size_of_optional_header, 0x00F0);
         assert_eq!(headers.characteristics, 0x0022);
+        assert_eq!(headers.optional.magic, OPTIONAL_MAGIC_PE32_PLUS);
+        assert_eq!(headers.optional.address_of_entry_point, 0x1440);
+        assert_eq!(headers.optional.image_base, 0x1_4000_0000);
+        assert_eq!(headers.optional.number_of_rva_and_sizes, 16);
+        assert_eq!(headers.optional.data_directory_offset, 0x108);
+        assert_eq!(headers.optional.data_directories.len(), 16);
+        assert!(headers.optional.data_directories[0].is_empty());
+        assert_eq!(headers.optional.data_directories[1].rva, 0x9000);
+        assert_eq!(headers.optional.data_directories[1].size, 0x908);
+        assert_eq!(headers.optional.data_directories[3].rva, 0x6000);
+        assert_eq!(headers.optional.data_directories[12].rva, 0x9280);
     }
 
     #[test]
     fn rejects_non_pe() {
         let err = parse(b"not a pe file").unwrap_err();
         assert!(matches!(err, Error::TooShort { .. }));
+    }
+
+    #[test]
+    fn rejects_bad_optional_magic() {
+        let mut bytes = minimal_pe();
+        bytes[0x98..0x9A].copy_from_slice(&0x1234u16.to_le_bytes());
+        let err = parse(&bytes).unwrap_err();
+        assert!(matches!(err, Error::BadOptionalMagic(0x1234)));
+    }
+
+    #[test]
+    fn rejects_truncated_optional_header() {
+        let mut bytes = minimal_pe();
+        bytes.truncate(0x100);
+        let err = parse(&bytes).unwrap_err();
+        assert!(matches!(err, Error::TooShort { .. }));
+    }
+
+    #[test]
+    fn respects_number_of_rva_and_sizes() {
+        let mut bytes = minimal_pe();
+        bytes[0x98 + 0x6C..0x98 + 0x70].copy_from_slice(&2u32.to_le_bytes());
+        let headers = parse(&bytes).expect("PE mínimo válido");
+        assert_eq!(headers.optional.data_directories.len(), 2);
+    }
+
+    #[test]
+    fn caps_data_directories_at_sixteen() {
+        let mut bytes = minimal_pe();
+        bytes[0x98 + 0x6C..0x98 + 0x70].copy_from_slice(&32u32.to_le_bytes());
+        let headers = parse(&bytes).expect("PE mínimo válido");
+        assert_eq!(headers.optional.data_directories.len(), 16);
     }
 }

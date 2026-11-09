@@ -10,6 +10,8 @@ const COFF_SIZE: usize = 20;
 const OPTIONAL_MAGIC_PE32: u16 = 0x010B;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020B;
 const DATA_DIRECTORY_ENTRIES: usize = 16;
+const SECTION_HEADER_SIZE: usize = 40;
+const SECTION_NAME_SIZE: usize = 8;
 
 #[derive(Debug)]
 enum Error {
@@ -85,6 +87,7 @@ struct Headers {
     size_of_optional_header: u16,
     characteristics: u16,
     optional: OptionalHeader,
+    sections: Vec<Section>,
 }
 
 #[derive(Debug)]
@@ -92,6 +95,17 @@ struct DataDirectoryEntry {
     index: usize,
     rva: u32,
     size: u32,
+}
+
+#[derive(Debug)]
+struct Section {
+    index: usize,
+    name: String,
+    virtual_size: u32,
+    virtual_address: u32,
+    size_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+    characteristics: u32,
 }
 
 impl DataDirectoryEntry {
@@ -295,20 +309,85 @@ fn parse(bytes: &[u8]) -> Result<Headers> {
         });
     }
 
+    let number_of_sections = read_u16(bytes, coff + 2)?;
     let size_of_optional_header = read_u16(bytes, coff + 16)?;
-    let optional = parse_optional(bytes, coff + COFF_SIZE, size_of_optional_header)?;
+
+    let optional_start = coff + COFF_SIZE;
+    let optional = parse_optional(bytes, optional_start, size_of_optional_header)?;
+
+    let section_table = optional_start + size_of_optional_header as usize;
+    let sections = parse_sections(bytes, section_table, number_of_sections as usize)?;
 
     Ok(Headers {
         e_lfanew,
         machine: read_u16(bytes, coff)?,
-        number_of_sections: read_u16(bytes, coff + 2)?,
+        number_of_sections,
         time_date_stamp: read_u32(bytes, coff + 4)?,
         pointer_to_symbol_table: read_u32(bytes, coff + 8)?,
         number_of_symbols: read_u32(bytes, coff + 12)?,
         size_of_optional_header,
         characteristics: read_u16(bytes, coff + 18)?,
         optional,
+        sections,
     })
+}
+
+fn read_section_name(bytes: &[u8], offset: usize) -> Result<String> {
+    let end = offset
+        .checked_add(SECTION_NAME_SIZE)
+        .ok_or(Error::OutOfBounds {
+            offset,
+            need: SECTION_NAME_SIZE,
+            len: bytes.len(),
+        })?;
+
+    let slice = bytes.get(offset..end).ok_or(Error::OutOfBounds {
+        offset,
+        need: SECTION_NAME_SIZE,
+        len: bytes.len(),
+    })?;
+
+    let name_end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+
+    Ok(String::from_utf8_lossy(&slice[..name_end]).into_owned())
+}
+
+fn parse_sections(bytes: &[u8], table_start: usize, count: usize) -> Result<Vec<Section>> {
+    let table_size = count * SECTION_HEADER_SIZE;
+
+    let table_end = table_start
+        .checked_add(table_size)
+        .ok_or(Error::OutOfBounds {
+            offset: table_start,
+            need: table_size,
+            len: bytes.len(),
+        })?;
+
+    if table_end > bytes.len() {
+        return Err(Error::TooShort {
+            what: "section table",
+            need: table_end,
+            got: bytes.len(),
+        });
+    }
+
+    let mut sections = Vec::with_capacity(count);
+
+    for index in 0..count {
+        let offset = table_start + index * SECTION_HEADER_SIZE;
+
+        sections.push(Section {
+            index,
+            name: read_section_name(bytes, offset)?,
+            virtual_size: read_u32(bytes, offset + 0x08)?,
+            virtual_address: read_u32(bytes, offset + 0x0C)?,
+            size_of_raw_data: read_u32(bytes, offset + 0x10)?,
+            pointer_to_raw_data: read_u32(bytes, offset + 0x14)?,
+            characteristics: read_u32(bytes, offset + 0x24)?,
+        })
+    }
+
+    Ok(sections)
 }
 
 fn machine_name(machine: u16) -> &'static str {
@@ -392,6 +471,35 @@ fn data_directory_name(index: usize) -> &'static str {
         15 => "Reserved",
         _ => "Desconocido",
     }
+}
+
+fn section_characteristics_names(characteristics: u32) -> String {
+    let flags: [(u32, &str); 10] = [
+        (0x0000_0020, "CNT_CODE"),
+        (0x0000_0040, "CNT_INITIALIZED_DATA"),
+        (0x0000_0080, "CNT_UNINITIALIZED_DATA"),
+        (0x0200_0000, "MEM_DISCARDABLE"),
+        (0x0400_0000, "MEM_NOT_CACHED"),
+        (0x0800_0000, "MEM_NOT_PAGED"),
+        (0x1000_0000, "MEM_SHARED"),
+        (0x2000_0000, "MEM_EXECUTE"),
+        (0x4000_0000, "MEM_READ"),
+        (0x8000_0000, "MEM_WRITE"),
+    ];
+
+    let mut names = Vec::new();
+
+    for (bit, name) in flags {
+        if characteristics & bit != 0 {
+            names.push(name);
+        }
+    }
+
+    if names.is_empty() {
+        names.push("-");
+    }
+
+    names.join(" | ")
 }
 
 fn print_headers(path: &str, bytes: &[u8], headers: &Headers) {
@@ -524,11 +632,36 @@ fn print_headers(path: &str, bytes: &[u8], headers: &Headers) {
     }
 }
 
+fn print_sections(path: &str, bytes: &[u8], headers: &Headers) {
+    println!("Archivo: {path} ({} bytes)", bytes.len());
+    println!();
+    println!("Sections ({})", headers.sections.len());
+    println!(
+        "  {:>3}  {:<10}  {:<10}  {:<10}  {:<10}  {:<10}  Characteristics",
+        "Idx", "Name", "VSize", "RVA", "RawSize", "RawPtr"
+    );
+
+    for section in &headers.sections {
+        println!(
+            "  {:>3}  {:<10}  0x{:08X}  0x{:08X}  0x{:08X}  0x{:08X}  0x{:08X} ({})",
+            section.index,
+            section.name,
+            section.virtual_size,
+            section.virtual_address,
+            section.size_of_raw_data,
+            section.pointer_to_raw_data,
+            section.characteristics,
+            section_characteristics_names(section.characteristics)
+        );
+    }
+}
+
 fn print_usage() {
     println!("pe-inspect 0.1.0");
     println!();
     println!("Uso:");
     println!("  pe-inspect --headers <archivo>");
+    println!("  pe-inspect --sections <archivo>");
     println!();
     println!("Ejemplo:");
     println!("  pe-inspect --headers C:\\Windows\\System32\\notepad.exe");
@@ -550,7 +683,13 @@ fn run(args: &[String]) -> Result<()> {
             print_headers(path, &bytes, &headers);
             Ok(())
         }
-        _ => Err(Error::Usage("pe-inspect --headers <archivo>")),
+        [flag, path] if flag.as_str() == "--sections" => {
+            let bytes = fs::read(path)?;
+            let headers = parse(&bytes)?;
+            print_sections(path, &bytes, &headers);
+            Ok(())
+        }
+        _ => Err(Error::Usage("pe-inspect --headers|--sections <archivo>")),
     }
 }
 
@@ -571,7 +710,7 @@ mod tests {
     use super::*;
 
     fn minimal_pe() -> Vec<u8> {
-        let mut bytes = vec![0u8; 0x200];
+        let mut bytes = vec![0u8; 0x600];
         bytes[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
         bytes[E_LFANEW_OFFSET..E_LFANEW_OFFSET + 4].copy_from_slice(&0x80u32.to_le_bytes());
         bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
@@ -603,6 +742,24 @@ mod tests {
         bytes[dd + 3 * 8 + 4..dd + 3 * 8 + 8].copy_from_slice(&0x234u32.to_le_bytes());
         bytes[dd + 12 * 8..dd + 12 * 8 + 4].copy_from_slice(&0x9280u32.to_le_bytes());
         bytes[dd + 12 * 8 + 4..dd + 12 * 8 + 8].copy_from_slice(&0x1B8u32.to_le_bytes());
+
+        let section_table = opt + 0xF0;
+
+        let text = section_table;
+        bytes[text..text + 8].copy_from_slice(b".text\0\0\0");
+        bytes[text + 0x08..text + 0x0C].copy_from_slice(&0x1B40u32.to_le_bytes());
+        bytes[text + 0x0C..text + 0x10].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[text + 0x10..text + 0x14].copy_from_slice(&0x1C00u32.to_le_bytes());
+        bytes[text + 0x14..text + 0x18].copy_from_slice(&0x600u32.to_le_bytes());
+        bytes[text + 0x24..text + 0x28].copy_from_slice(&0x60000020u32.to_le_bytes());
+
+        let data = section_table + 0x28;
+        bytes[data..data + 8].copy_from_slice(b".data\0\0\0");
+        bytes[data + 0x08..data + 0x0C].copy_from_slice(&0xC0u32.to_le_bytes());
+        bytes[data + 0x0C..data + 0x10].copy_from_slice(&0x3000u32.to_le_bytes());
+        bytes[data + 0x10..data + 0x14].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[data + 0x14..data + 0x18].copy_from_slice(&0x2200u32.to_le_bytes());
+        bytes[data + 0x24..data + 0x28].copy_from_slice(&0xC0000040u32.to_le_bytes());
 
         bytes
     }
@@ -666,5 +823,39 @@ mod tests {
         bytes[0x98 + 0x6C..0x98 + 0x70].copy_from_slice(&32u32.to_le_bytes());
         let headers = parse(&bytes).expect("PE mínimo válido");
         assert_eq!(headers.optional.data_directories.len(), 16);
+    }
+
+    #[test]
+    fn parses_sections() {
+        let bytes = minimal_pe();
+        let headers = parse(&bytes).expect("PE mínimo válido");
+
+        assert_eq!(headers.sections.len(), 8);
+        assert_eq!(headers.sections[0].name, ".text");
+        assert_eq!(headers.sections[0].virtual_size, 0x1B40);
+        assert_eq!(headers.sections[0].virtual_address, 0x1000);
+        assert_eq!(headers.sections[0].size_of_raw_data, 0x1C00);
+        assert_eq!(headers.sections[0].pointer_to_raw_data, 0x600);
+        assert_eq!(headers.sections[0].characteristics, 0x60000020);
+        assert_eq!(headers.sections[1].name, ".data");
+        assert_eq!(headers.sections[1].virtual_address, 0x3000);
+    }
+
+    #[test]
+    fn rejects_truncated_section_table() {
+        let mut bytes = minimal_pe();
+        bytes.truncate(0x190);
+
+        let err = parse(&bytes).unwrap_err();
+        assert!(matches!(err, Error::TooShort { .. }));
+    }
+
+    #[test]
+    fn handles_zero_sections() {
+        let mut bytes = minimal_pe();
+        bytes[0x84 + 2..0x84 + 4].copy_from_slice(&0u16.to_le_bytes());
+
+        let headers = parse(&bytes).expect("PE mínimo válido");
+        assert!(headers.sections.is_empty());
     }
 }

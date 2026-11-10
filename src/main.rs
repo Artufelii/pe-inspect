@@ -390,6 +390,37 @@ fn parse_sections(bytes: &[u8], table_start: usize, count: usize) -> Result<Vec<
     Ok(sections)
 }
 
+fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+
+    let mut counts = [0u64; 256];
+    for &byte in data {
+        counts[byte as usize] += 1;
+    }
+
+    let n = data.len() as f64;
+    let mut entropy = 0.0;
+
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / n;
+            entropy -= p * p.log2();
+        }
+    }
+
+    entropy
+}
+
+fn section_entropy(bytes: &[u8], section: &Section) -> Option<f64> {
+    let start = section.pointer_to_raw_data as usize;
+    let size = section.size_of_raw_data as usize;
+    let end = start.checked_add(size)?;
+    let data = bytes.get(start..end)?;
+    Some(shannon_entropy(data))
+}
+
 fn machine_name(machine: u16) -> &'static str {
     match machine {
         0x014C => "i386 (x86)",
@@ -637,19 +668,24 @@ fn print_sections(path: &str, bytes: &[u8], headers: &Headers) {
     println!();
     println!("Sections ({})", headers.sections.len());
     println!(
-        "  {:>3}  {:<10}  {:<10}  {:<10}  {:<10}  {:<10}  Characteristics",
-        "Idx", "Name", "VSize", "RVA", "RawSize", "RawPtr"
+        "  {:>3}  {:<10}  {:<10}  {:<10}  {:<10}  {:<10}  {:>7}  Characteristics",
+        "Idx", "Name", "VSize", "RVA", "RawSize", "RawPtr", "Entropy"
     );
 
     for section in &headers.sections {
+        let entropy = section_entropy(bytes, section)
+            .map(|e| format!("{e:.2}"))
+            .unwrap_or_else(|| "N/A".to_string());
+
         println!(
-            "  {:>3}  {:<10}  0x{:08X}  0x{:08X}  0x{:08X}  0x{:08X}  0x{:08X} ({})",
+            "  {:>3}  {:<10}  0x{:08X}  0x{:08X}  0x{:08X}  0x{:08X}  {:>7}  0x{:08X} ({})",
             section.index,
             section.name,
             section.virtual_size,
             section.virtual_address,
             section.size_of_raw_data,
             section.pointer_to_raw_data,
+            entropy,
             section.characteristics,
             section_characteristics_names(section.characteristics)
         );
@@ -710,7 +746,7 @@ mod tests {
     use super::*;
 
     fn minimal_pe() -> Vec<u8> {
-        let mut bytes = vec![0u8; 0x600];
+        let mut bytes = vec![0u8; 0x2400];
         bytes[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
         bytes[E_LFANEW_OFFSET..E_LFANEW_OFFSET + 4].copy_from_slice(&0x80u32.to_le_bytes());
         bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
@@ -839,6 +875,9 @@ mod tests {
         assert_eq!(headers.sections[0].characteristics, 0x60000020);
         assert_eq!(headers.sections[1].name, ".data");
         assert_eq!(headers.sections[1].virtual_address, 0x3000);
+
+        assert_eq!(section_entropy(&bytes, &headers.sections[0]), Some(0.0));
+        assert_eq!(section_entropy(&bytes, &headers.sections[1]), Some(0.0));
     }
 
     #[test]
@@ -857,5 +896,23 @@ mod tests {
 
         let headers = parse(&bytes).expect("PE mínimo válido");
         assert!(headers.sections.is_empty());
+    }
+
+    #[test]
+    fn entropy_empty_and_zeros_is_zero() {
+        assert_eq!(shannon_entropy(&[]), 0.0);
+        assert_eq!(shannon_entropy(&[0u8; 8]), 0.0);
+    }
+
+    #[test]
+    fn entropy_two_values_is_one() {
+        let data = [0u8, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!((shannon_entropy(&data) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn entropy_all_byte_values_is_eight() {
+        let data: Vec<u8> = (0..=255).collect();
+        assert!((shannon_entropy(&data) - 8.0).abs() < 1e-9);
     }
 }

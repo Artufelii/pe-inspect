@@ -2,5 +2,12 @@
 name = "pe-inspect"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Dependency-free PE32/PE32+ inspector in Rust: headers, sections and per-section Shannon entropy."
+license = "MIT"
+repository = "https://github.com/Artufelii/pe-inspect"
+readme = "README.md"
+keywords = ["pe", "windows", "reverse-engineering", "malware-analysis", "parser"]
+categories = ["command-line-utilities", "development-tools::debugging"]
 
 [dependencies]

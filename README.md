@@ -1,5 +1,7 @@
 # pe-inspect
 
+[![CI](https://github.com/Artufelii/pe-inspect/actions/workflows/ci.yml/badge.svg)](https://github.com/Artufelii/pe-inspect/actions/workflows/ci.yml)
+
 A small, dependency-free PE header inspector written in Rust. It reads the DOS
 header, the PE signature, the COFF file header, the optional header (PE32 and
 PE32+), and the data directory table. It is the first stage of a larger PE
@@ -192,24 +194,30 @@ cd fixtures && make
 
 ```text
 .
+├── .github/workflows/ci.yml
 ├── Cargo.lock
 ├── Cargo.toml
+├── LICENSE
 ├── create_txt.sh
 ├── docs/design-notes.md
 ├── fixtures
-│   ├── hello32.exe
-│   ├── hello64.exe
-│   ├── hello.c
-│   ├── hello.cs
-│   ├── hello-net.exe
-│   ├── Makefile
-│   └── README.md
+│   ├── hello32.exe
+│   ├── hello64.exe
+│   ├── hello.c
+│   ├── hello.cs
+│   ├── hello-net.exe
+│   ├── Makefile
+│   └── README.md
 ├── README.md
 ├── src/main.rs
-
+└── tools/entropy.py
 ```
 
 ## Design notes
 
 See [docs/design-notes.md](docs/design-notes.md) for the decisions behind the
 parser (std-only, bounds checks, raw timestamps, data directory limits).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
